@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+CALL="/proc/acpi/call"
+BAT="/sys/class/power_supply/BAT0"
+AC="/sys/class/power_supply/ACAD/online"
+
+TARGET=80
+RESUME=75
+
+# Track the last policy action we intentionally applied.
+# This prevents repeated AUTO/INHIBIT commands.
+last_policy="unknown"
+last_ac="unknown"
+
+log() {
+    echo "[hp-battery-limit] $*"
+}
+
+acpi_call() {
+    printf '%s\n' "$1" > "$CALL"
+    tr -d '\0' < "$CALL"
+}
+
+get_mode() {
+    local result
+
+    result=$(acpi_call '\_SB.WMID.GBCO')
+
+    if [[ "$result" =~ \{0x04, ]]; then
+        echo "inhibit"
+    elif [[ "$result" =~ \{0x00, ]]; then
+        echo "auto"
+    else
+        echo "unknown"
+    fi
+}
+
+set_inhibit() {
+    local result
+
+    log "Applying INHIBIT at ${capacity}%..."
+
+    result=$(acpi_call '\_SB.WMID.SBCO 0 5 0 0')
+    log "SBCO result: $result"
+
+    if [[ "$result" != \[0x0,* ]]; then
+        log "ERROR: INHIBIT command failed"
+        return 1
+    fi
+
+    if [[ "$(get_mode)" != "inhibit" ]]; then
+        log "ERROR: firmware did not confirm INHIBIT"
+        return 1
+    fi
+
+    last_policy="inhibit"
+    log "INHIBIT confirmed"
+}
+
+set_auto() {
+    local result
+
+    log "Applying AUTO at ${capacity}%..."
+
+    result=$(acpi_call '\_SB.WMID.SBCO 0 0 0 0')
+    log "SBCO result: $result"
+
+    if [[ "$result" != \[0x0,* ]]; then
+        log "ERROR: AUTO command failed"
+        return 1
+    fi
+
+    if [[ "$(get_mode)" != "auto" ]]; then
+        log "ERROR: firmware did not confirm AUTO"
+        return 1
+    fi
+
+    last_policy="auto"
+    log "AUTO confirmed"
+}
+
+if [[ ! -e "$CALL" ]]; then
+    log "Loading acpi_call..."
+    modprobe acpi_call || exit 1
+fi
+
+log "Controller started"
+log "Target: ${TARGET}%"
+log "Resume: ${RESUME}%"
+
+while true; do
+
+    if [[ ! -r "$AC" || ! -r "$BAT/capacity" ]]; then
+        log "Battery/AC interface unavailable"
+        sleep 10
+        continue
+    fi
+
+    ac=$(cat "$AC")
+    capacity=$(cat "$BAT/capacity")
+
+    # Reset policy state when AC changes.
+    # The firmware clears inhibit when AC is removed/reconnected.
+    if [[ "$last_ac" != "unknown" && "$ac" != "$last_ac" ]]; then
+        log "AC state changed: ${last_ac} -> ${ac}"
+        last_policy="unknown"
+    fi
+
+    last_ac="$ac"
+
+    if [[ "$ac" == "1" ]]; then
+
+        # Above/equal target: inhibit charging.
+        if (( capacity >= TARGET )); then
+
+            if [[ "$last_policy" != "inhibit" ]]; then
+                set_inhibit || true
+            fi
+
+        # At/below resume point: allow normal charging.
+        elif (( capacity <= RESUME )); then
+
+            if [[ "$last_policy" != "auto" ]]; then
+                set_auto || true
+            fi
+        fi
+    fi
+
+    sleep 10
+done

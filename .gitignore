@@ -1,0 +1,9 @@
+DSDT.dat
+DSDT.dsl
+*.dat
+*.dsl
+*.swp
+*~
+.directory
+*.log
+
